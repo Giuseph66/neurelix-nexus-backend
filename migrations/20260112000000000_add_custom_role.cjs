@@ -71,3 +71,4 @@ exports.down = (pgm) => {
   // Nota: Não podemos remover um valor de enum facilmente, então deixamos 'custom' no enum
 };
 
+

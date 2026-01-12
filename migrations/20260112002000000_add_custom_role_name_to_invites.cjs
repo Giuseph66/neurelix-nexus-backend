@@ -34,3 +34,4 @@ exports.down = (pgm) => {
   pgm.dropColumn({ schema: 'public', name: 'project_invites' }, 'custom_role_name');
 };
 
+
