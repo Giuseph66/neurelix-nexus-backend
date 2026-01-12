@@ -58,8 +58,18 @@ exports.up = (pgm) => {
     { ifNotExists: true }
   );
 
-  pgm.createIndex({ schema: 'public', name: 'projects' }, 'slug', { unique: true });
-  pgm.createIndex({ schema: 'public', name: 'projects' }, 'created_by');
+  // Criar índices apenas se não existirem (para evitar erro se tabela já foi criada)
+  pgm.sql(`
+    DO $$ 
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'projects_slug_unique_index' AND tablename = 'projects') THEN
+        CREATE UNIQUE INDEX projects_slug_unique_index ON public.projects (slug);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'projects_created_by_index' AND tablename = 'projects') THEN
+        CREATE INDEX projects_created_by_index ON public.projects (created_by);
+      END IF;
+    END $$;
+  `);
 
   // Criar tabela whiteboards (essencial para assistant_messages)
   pgm.createTable(
@@ -127,9 +137,21 @@ exports.up = (pgm) => {
     { ifNotExists: true }
   );
 
-  pgm.createIndex({ schema: 'public', name: 'whiteboards' }, 'project_id');
-  pgm.createIndex({ schema: 'public', name: 'whiteboards' }, 'parent_branch_id');
-  pgm.createIndex({ schema: 'public', name: 'whiteboards' }, 'created_by');
+  // Criar índices apenas se não existirem
+  pgm.sql(`
+    DO $$ 
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'whiteboards_project_id_index' AND tablename = 'whiteboards') THEN
+        CREATE INDEX whiteboards_project_id_index ON public.whiteboards (project_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'whiteboards_parent_branch_id_index' AND tablename = 'whiteboards') THEN
+        CREATE INDEX whiteboards_parent_branch_id_index ON public.whiteboards (parent_branch_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'whiteboards_created_by_index' AND tablename = 'whiteboards') THEN
+        CREATE INDEX whiteboards_created_by_index ON public.whiteboards (created_by);
+      END IF;
+    END $$;
+  `);
 };
 
 exports.down = (pgm) => {
