@@ -2901,7 +2901,40 @@ export async function functionsRoutes(app: FastifyInstance) {
         projectId: z.string().uuid().optional(),
       }).parse(req.body);
 
-      const GEMINI_API_KEY = app.env.GEMINI_API_KEY;
+      // Importar funções de rotação
+      const { 
+        getApiKeyWithRotation, 
+        recordApiKeySuccess, 
+        recordApiKeyError, 
+        isTimeoutOrRateLimitError 
+      } = await import('../utils/api-key-rotation.js');
+      
+      // Tentar obter chave do banco de dados primeiro, fallback para env
+      let GEMINI_API_KEY: string | undefined;
+      let initialKeyId: string | undefined;
+      let initialModelPrimary = 'gemini-2.5-flash';
+      let initialModelFallback = 'gemini-2.5-flash-lite';
+      
+      if (projectId) {
+        try {
+          const rotationResult = await getApiKeyWithRotation(
+            app.db,
+            projectId,
+            'GEMINI'
+          );
+          GEMINI_API_KEY = rotationResult.apiKey;
+          initialKeyId = rotationResult.keyId;
+          initialModelPrimary = rotationResult.modelPrimary;
+          initialModelFallback = rotationResult.modelFallback;
+        } catch (error) {
+          // Se não houver chaves no banco, usa a do env
+          GEMINI_API_KEY = app.env.GEMINI_API_KEY;
+        }
+      } else {
+        // Se não houver projectId, usa a chave do env
+        GEMINI_API_KEY = app.env.GEMINI_API_KEY;
+      }
+      
       if (!GEMINI_API_KEY) {
         return reply.code(500).send({ error: 'GEMINI_API_KEY não configurada' });
       }
@@ -3094,7 +3127,7 @@ Exemplo de Fluxo de Compra:
         }
       };
 
-      const callGemini = async (model: string) => {
+      const callGemini = async (model: string, apiKey: string = GEMINI_API_KEY, keyId?: string) => {
         const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
         try {
@@ -3102,7 +3135,7 @@ Exemplo de Fluxo de Compra:
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "x-goog-api-key": GEMINI_API_KEY,
+              "x-goog-api-key": apiKey,
             },
             body: JSON.stringify(requestBody),
           });
@@ -3119,19 +3152,38 @@ Exemplo de Fluxo de Compra:
               errorMessage = errorText || `Erro ${status}`;
             }
 
-            return { ok: false as const, status, error: errorMessage };
+            // Registrar erro se tiver keyId e projectId
+            if (keyId && projectId) {
+              const isTimeout = isTimeoutOrRateLimitError({ status, message: errorMessage });
+              await recordApiKeyError(app.db, keyId, errorMessage, isTimeout);
+            }
+
+            return { ok: false as const, status, error: errorMessage, shouldRetry: status === 429 || status === 503 };
           }
 
           const data = await response.json();
 
           if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
-            return { ok: false as const, status: 500, error: "Resposta inválida da API do Gemini" };
+            const errorMsg = "Resposta inválida da API do Gemini";
+            if (keyId && projectId) {
+              await recordApiKeyError(app.db, keyId, errorMsg, false);
+            }
+            return { ok: false as const, status: 500, error: errorMsg };
           }
 
           const generatedText = data.candidates[0].content.parts[0]?.text || "";
 
           if (!generatedText) {
-            return { ok: false as const, status: 500, error: "Resposta vazia da API do Gemini" };
+            const errorMsg = "Resposta vazia da API do Gemini";
+            if (keyId && projectId) {
+              await recordApiKeyError(app.db, keyId, errorMsg, false);
+            }
+            return { ok: false as const, status: 500, error: errorMsg };
+          }
+
+          // Registrar sucesso
+          if (keyId && projectId) {
+            await recordApiKeySuccess(app.db, keyId);
           }
 
           return {
@@ -3140,42 +3192,102 @@ Exemplo de Fluxo de Compra:
             finishReason: data.candidates[0].finishReason || "stop",
           };
         } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Erro desconhecido";
+          if (keyId && projectId) {
+            const isTimeout = isTimeoutOrRateLimitError(error);
+            await recordApiKeyError(app.db, keyId, errorMsg, isTimeout);
+          }
           return {
             ok: false as const,
             status: 500,
-            error: error instanceof Error ? error.message : "Erro desconhecido",
+            error: errorMsg,
+            shouldRetry: false,
           };
         }
       };
 
       try {
-        const primaryResult = await callGemini('gemini-2.5-flash');
-        let result = primaryResult;
-
-        if (!primaryResult.ok) {
-          const fallbackResult = await callGemini('gemini-2.5-flash-lite');
-          if (!fallbackResult.ok) {
-            const status = fallbackResult.status ?? primaryResult.status ?? 500;
-            const shouldRateLimit = primaryResult.status === 429 || fallbackResult.status === 429;
-
-            if (shouldRateLimit) {
-              return reply.code(429).send({
-                error: "Limite de requisições excedido. Tente novamente em alguns segundos."
-              });
+        let result: any;
+        let attempts = 0;
+        const maxAttempts = projectId ? 3 : 1; // Tenta rotação apenas se tiver projectId
+        
+        while (attempts < maxAttempts) {
+          let currentApiKey = GEMINI_API_KEY;
+          let currentKeyId: string | undefined = undefined;
+          let currentModelPrimary = initialModelPrimary;
+          let currentModelFallback = initialModelFallback;
+          
+          // Se tiver projectId, tenta obter chave do banco
+          if (projectId) {
+            if (attempts === 0) {
+              // Primeira tentativa usa a chave já obtida anteriormente
+              currentKeyId = initialKeyId;
+            } else {
+              // Tentativas subsequentes buscam nova chave
+              try {
+                const rotationResult = await getApiKeyWithRotation(
+                  app.db,
+                  projectId,
+                  'GEMINI'
+                );
+                currentApiKey = rotationResult.apiKey;
+                currentKeyId = rotationResult.keyId;
+                currentModelPrimary = rotationResult.modelPrimary;
+                currentModelFallback = rotationResult.modelFallback;
+              } catch (error) {
+                // Se não conseguir nova chave, usa a do env
+                currentApiKey = app.env.GEMINI_API_KEY || GEMINI_API_KEY;
+                currentKeyId = undefined;
+              }
             }
+          }
+          
+          const primaryResult = await callGemini(currentModelPrimary, currentApiKey, currentKeyId);
+          
+          if (primaryResult.ok) {
+            result = primaryResult;
+            break;
+          }
+          
+          // Se for rate limit/timeout e tiver projectId, tenta outra chave
+          if (primaryResult.shouldRetry && projectId && attempts < maxAttempts - 1) {
+            attempts++;
+            continue;
+          }
+          
+          // Tenta fallback para modelo alternativo
+          const fallbackResult = await callGemini(currentModelFallback, currentApiKey, currentKeyId);
+          
+          if (fallbackResult.ok) {
+            result = fallbackResult;
+            break;
+          }
+          
+          // Se ainda falhar e tiver projectId, tenta próxima chave
+          if (fallbackResult.shouldRetry && projectId && attempts < maxAttempts - 1) {
+            attempts++;
+            continue;
+          }
+          
+          // Se não conseguir mais tentar, retorna erro
+          const status = fallbackResult.status ?? primaryResult.status ?? 500;
+          const shouldRateLimit = primaryResult.status === 429 || fallbackResult.status === 429;
 
-            if (status === 401 || status === 403) {
-              return reply.code(status).send({
-                error: "Chave API inválida ou não autorizada. Verifique a configuração da GEMINI_API_KEY."
-              });
-            }
-
-            return reply.code(status).send({
-              error: fallbackResult.error || primaryResult.error || "Erro no serviço de IA"
+          if (shouldRateLimit) {
+            return reply.code(429).send({
+              error: "Limite de requisições excedido. Tente novamente em alguns segundos."
             });
           }
 
-          result = fallbackResult;
+          if (status === 401 || status === 403) {
+            return reply.code(status).send({
+              error: "Chave API inválida ou não autorizada. Verifique a configuração da chave de API."
+            });
+          }
+
+          return reply.code(status).send({
+            error: fallbackResult.error || primaryResult.error || "Erro no serviço de IA"
+          });
         }
 
         let generatedText = result.text;

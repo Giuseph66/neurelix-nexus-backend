@@ -196,9 +196,9 @@ export const boardRoutes: FastifyPluginAsync = async (app) => {
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
 
-    // Verify user has access (admin only)
+    // Verify user has access to project
     const memberCheck = await app.db.query(
-      `SELECT pm.role FROM boards b
+      `SELECT b.id, b.project_id FROM boards b
        INNER JOIN project_members pm ON pm.project_id = b.project_id
        WHERE b.id = $1 AND pm.user_id = $2`,
       [id, (req as any).user.userId]
@@ -208,10 +208,7 @@ export const boardRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(404).send({ error: 'Board not found' });
     }
 
-    if (memberCheck.rows[0].role !== 'admin') {
-      return reply.code(403).send({ error: 'Only admins can delete boards' });
-    }
-
+    // Delete board (cascade will handle related records: workflows, tarefas, sprints)
     await app.db.query('DELETE FROM boards WHERE id = $1', [id]);
 
     return reply.code(204).send();
